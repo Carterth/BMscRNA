@@ -1,0 +1,210 @@
+---
+title: "Calvarial marrow CellChat analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(CellChat)
+  library(ggplot2)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(grid)
+  library(NMF)
+  library(ggalluvial)
+  library(scales)
+})
+
+# Analysis performed with CellChat v2.1.2.
+if (packageVersion("CellChat") != package_version("2.1.2")) {
+  stop(
+    "This script requires CellChat v2.1.2. Installed version: ",
+    packageVersion("CellChat")
+  )
+}
+
+obj <- readRDS(file.path("results", "processed_combined_obj.rds"))
+fig_dir <- "figures"
+out_dir <- file.path("results", "CellChat_calvarial")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+cluster_order <- levels(Idents(obj))
+cluster_colors <- setNames(scales::hue_pal()(length(cluster_order)), cluster_order)
+```
+
+```{r}
+calvarial <- subset(obj, subset = tissue == "Calvarial")
+Idents(calvarial) <- Idents(obj)[Cells(calvarial)]
+
+calvarial_vehicle <- subset(calvarial, subset = condition == "VEH")
+calvarial_thc <- subset(calvarial, subset = condition == "THC")
+
+run_cellchat <- function(seu) {
+  cc <- createCellChat(seu, group.by = "ident", assay = "RNA")
+  cc@DB <- CellChatDB.mouse
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc, do.fast = FALSE)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc)
+  cc <- filterCommunication(cc, min.cells = 10)
+  cc <- computeCommunProbPathway(cc)
+  cc <- aggregateNet(cc)
+  cc
+}
+
+cellchat_vehicle <- run_cellchat(calvarial_vehicle)
+cellchat_thc <- run_cellchat(calvarial_thc)
+cellchat_merged <- mergeCellChat(
+  list(Vehicle = cellchat_vehicle, THC = cellchat_thc),
+  add.names = c("Vehicle", "THC")
+)
+
+saveRDS(cellchat_vehicle, file.path(out_dir, "calvarial_vehicle_CellChat.rds"))
+saveRDS(cellchat_thc, file.path(out_dir, "calvarial_THC_CellChat.rds"))
+saveRDS(cellchat_merged, file.path(out_dir, "calvarial_merged_CellChat.rds"))
+```
+
+```{r}
+p_count <- compareInteractions(cellchat_merged, show.legend = FALSE, group = c(1, 2))
+p_weight <- compareInteractions(
+  cellchat_merged,
+  show.legend = FALSE,
+  group = c(1, 2),
+  measure = "weight"
+)
+p_interactions <- p_count + p_weight
+p_interactions
+
+ggsave(file.path(fig_dir, "Figure3E_calvarial_CellChat_totals.png"),
+       p_interactions, width = 8, height = 4.5, dpi = 300)
+```
+
+```{r}
+groups_present <- levels(Idents(calvarial))
+color_use <- cluster_colors[groups_present]
+
+png(file.path(fig_dir, "Figure3F_calvarial_CellChat_diff_circles.png"),
+    width = 3600, height = 1800, res = 300)
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_diffInteraction(
+  cellchat_merged,
+  weight.scale = TRUE,
+  measure = "count",
+  color.use = color_use
+)
+netVisual_diffInteraction(
+  cellchat_merged,
+  weight.scale = TRUE,
+  measure = "weight",
+  color.use = color_use
+)
+dev.off()
+
+ht_count <- netVisual_heatmap(cellchat_merged, measure = "count", color.use = color_use)
+ht_weight <- netVisual_heatmap(cellchat_merged, measure = "weight", color.use = color_use)
+
+png(file.path(fig_dir, "Figure3D_calvarial_CellChat_heatmaps.png"),
+    width = 3600, height = 1800, res = 300)
+ComplexHeatmap::draw(ht_count + ht_weight, ht_gap = unit(5, "mm"))
+dev.off()
+```
+
+```{r}
+cellchat_vehicle <- netAnalysis_computeCentrality(cellchat_vehicle, slot.name = "netP")
+cellchat_thc <- netAnalysis_computeCentrality(cellchat_thc, slot.name = "netP")
+pathways <- union(cellchat_vehicle@netP$pathways, cellchat_thc@netP$pathways)
+
+ht_out_vehicle <- netAnalysis_signalingRole_heatmap(
+  cellchat_vehicle,
+  pattern = "outgoing",
+  signaling = pathways,
+  slot.name = "netP",
+  color.use = color_use,
+  title = "Vehicle"
+)
+ht_out_thc <- netAnalysis_signalingRole_heatmap(
+  cellchat_thc,
+  pattern = "outgoing",
+  signaling = pathways,
+  slot.name = "netP",
+  color.use = color_use,
+  title = "THC"
+)
+ht_in_vehicle <- netAnalysis_signalingRole_heatmap(
+  cellchat_vehicle,
+  pattern = "incoming",
+  signaling = pathways,
+  slot.name = "netP",
+  color.use = color_use,
+  title = "Vehicle"
+)
+ht_in_thc <- netAnalysis_signalingRole_heatmap(
+  cellchat_thc,
+  pattern = "incoming",
+  signaling = pathways,
+  slot.name = "netP",
+  color.use = color_use,
+  title = "THC"
+)
+
+png(file.path(fig_dir, "Figure3H_calvarial_CellChat_incoming.png"),
+    width = 3600, height = 3000, res = 300)
+ComplexHeatmap::draw(ht_in_vehicle + ht_in_thc, ht_gap = unit(3, "mm"))
+dev.off()
+
+png(file.path(fig_dir, "Figure3G_calvarial_CellChat_outgoing.png"),
+    width = 3600, height = 3000, res = 300)
+ComplexHeatmap::draw(ht_out_vehicle + ht_out_thc, ht_gap = unit(3, "mm"))
+dev.off()
+
+p_scatter_vehicle <- netAnalysis_signalingRole_scatter(
+  cellchat_vehicle,
+  slot.name = "netP",
+  color.use = color_use,
+  title = "Vehicle"
+)
+p_scatter_thc <- netAnalysis_signalingRole_scatter(
+  cellchat_thc,
+  slot.name = "netP",
+  color.use = color_use,
+  title = "THC"
+)
+p_scatter <- p_scatter_vehicle + p_scatter_thc
+p_scatter
+
+ggsave(file.path(fig_dir, "Figure3I_calvarial_CellChat_sender_receiver.png"),
+       p_scatter, width = 10, height = 5, dpi = 300)
+```
+
+```{r}
+set.seed(1234)
+
+cellchat_vehicle <- identifyCommunicationPatterns(cellchat_vehicle, pattern = "outgoing", k = 4)
+cellchat_vehicle <- identifyCommunicationPatterns(cellchat_vehicle, pattern = "incoming", k = 4)
+cellchat_thc <- identifyCommunicationPatterns(cellchat_thc, pattern = "outgoing", k = 4)
+cellchat_thc <- identifyCommunicationPatterns(cellchat_thc, pattern = "incoming", k = 4)
+
+p_in_vehicle <- netAnalysis_dot(cellchat_vehicle, pattern = "incoming")
+p_in_thc <- netAnalysis_dot(cellchat_thc, pattern = "incoming")
+p_out_vehicle <- netAnalysis_dot(cellchat_vehicle, pattern = "outgoing")
+p_out_thc <- netAnalysis_dot(cellchat_thc, pattern = "outgoing")
+
+p_incoming <- p_in_vehicle + p_in_thc
+p_outgoing <- p_out_vehicle + p_out_thc
+
+p_incoming
+p_outgoing
+
+ggsave(file.path(fig_dir, "Figure3J_calvarial_CellChat_incoming_patterns.png"),
+       p_incoming, width = 12, height = 6, dpi = 300)
+ggsave(file.path(fig_dir, "Figure3K_calvarial_CellChat_outgoing_patterns.png"),
+       p_outgoing, width = 12, height = 6, dpi = 300)
+
+saveRDS(cellchat_vehicle, file.path(out_dir, "calvarial_vehicle_CellChat_patterns.rds"))
+saveRDS(cellchat_thc, file.path(out_dir, "calvarial_THC_CellChat_patterns.rds"))
+```

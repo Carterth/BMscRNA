@@ -1,0 +1,329 @@
+---
+title: "scRNA-seq preprocessing and annotation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(stringr)
+})
+
+data_dir <- "data"
+out_dir <- "results"
+fig_dir <- "figures"
+dir.create(out_dir, showWarnings = FALSE)
+dir.create(fig_dir, showWarnings = FALSE)
+
+sample_ids <- c("fVEH", "fTHC", "cVEH", "cTHC")
+
+read_geo_matrix <- function(sample_id) {
+  ReadMtx(
+    mtx = file.path(data_dir, paste0(sample_id, "_matrix.mtx.gz")),
+    cells = file.path(data_dir, paste0(sample_id, "_barcodes.tsv.gz")),
+    features = file.path(data_dir, paste0(sample_id, "_features.tsv.gz")),
+    feature.column = 2
+  )
+}
+```
+
+```{r}
+objs <- lapply(sample_ids, function(sample_id) {
+  mat <- read_geo_matrix(sample_id)
+
+  x <- CreateSeuratObject(
+    counts = mat,
+    project = sample_id,
+    min.cells = 3
+  )
+
+  x[["percent.mt"]] <- PercentageFeatureSet(x, pattern = "^mt-")
+  x <- NormalizeData(x, verbose = FALSE)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+
+  subset(
+    x,
+    subset = nFeature_RNA > 200 &
+      nFeature_RNA < 7500 &
+      percent.mt < 10
+  )
+})
+names(objs) <- sample_ids
+```
+
+```{r}
+anchors <- FindIntegrationAnchors(object.list = objs, dims = 1:30)
+obj <- IntegrateData(anchorset = anchors, dims = 1:30)
+
+obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 3000)
+all_genes <- rownames(obj)
+obj <- ScaleData(obj, features = all_genes, assay = "RNA")
+obj <- ScaleData(obj, features = all_genes)
+obj <- JoinLayers(obj, assay = "RNA", layers = c("counts", "data"))
+
+obj <- RunPCA(obj, features = VariableFeatures(obj))
+obj <- RunUMAP(obj, dims = 1:25)
+obj <- FindNeighbors(obj, dims = 1:25)
+obj <- FindClusters(obj, resolution = 0.6)
+
+DefaultAssay(obj) <- "RNA"
+```
+
+```{r}
+obj$SampleGroup <- dplyr::recode(
+  obj$orig.ident,
+  fVEH = "Femoral_VEH",
+  fTHC = "Femoral_THC",
+  cVEH = "Calvarial_VEH",
+  cTHC = "Calvarial_THC"
+)
+
+obj$SampleGroup <- factor(
+  obj$SampleGroup,
+  levels = c("Femoral_VEH", "Femoral_THC", "Calvarial_VEH", "Calvarial_THC")
+)
+
+obj$tissue <- factor(
+  ifelse(startsWith(obj$orig.ident, "f"), "Femoral", "Calvarial"),
+  levels = c("Femoral", "Calvarial")
+)
+
+obj$condition <- factor(
+  ifelse(endsWith(obj$orig.ident, "THC"), "THC", "VEH"),
+  levels = c("VEH", "THC")
+)
+
+obj$stim_facet <- factor(
+  gsub("_", "+", obj$SampleGroup),
+  levels = c("Femoral+VEH", "Femoral+THC", "Calvarial+VEH", "Calvarial+THC")
+)
+```
+
+```{r}
+cluster_ids <- c(
+  "0" = "Inflammatory Early Neutrophils",
+  "1" = "Antigen-presenting B Cells",
+  "2" = "Mature CXCR2+ Neutrophils",
+  "3" = "Neutrophils (Metamyelocyte)",
+  "4" = "Pre-B Cells",
+  "5" = "Neutrophils (Promyelocytes)",
+  "6" = "Granulocyte-Monocyte Progenitors (GMPs)",
+  "7" = "Classical Monocytes",
+  "8" = "CD3+ T Cells",
+  "9" = "Immature B Cells",
+  "10" = "Proliferating Myeloid Progenitors",
+  "11" = "Cycling Pre-B Cells",
+  "12" = "Proerythroblasts",
+  "13" = "Macrophages",
+  "14" = "Hematopoietic Stem Cells",
+  "15" = "Plasmacytoid Dendritic Cells",
+  "16" = "Pro-B Cells",
+  "17" = "Cycling Promyelocytes",
+  "18" = "Eyrthrocytes",
+  "19" = "Basophils",
+  "20" = "Resident Macrophages",
+  "21" = "Cycling B Cells",
+  "22" = "Mesenchymal Stem Cells"
+)
+
+obj <- RenameIdents(obj, cluster_ids)
+
+desired_order <- c(
+  "Inflammatory Early Neutrophils",
+  "Antigen-presenting B Cells",
+  "Mature CXCR2+ Neutrophils",
+  "Neutrophils (Metamyelocyte)",
+  "Pre-B Cells",
+  "Neutrophils (Promyelocytes)",
+  "Granulocyte-Monocyte Progenitors (GMPs)",
+  "Classical Monocytes",
+  "CD3+ T Cells",
+  "Immature B Cells",
+  "Proliferating Myeloid Progenitors",
+  "Cycling Pre-B Cells",
+  "Proerythroblasts",
+  "Macrophages",
+  "Hematopoietic Stem Cells",
+  "Plasmacytoid Dendritic Cells",
+  "Pro-B Cells",
+  "Cycling Promyelocytes",
+  "Eyrthrocytes",
+  "Basophils",
+  "Resident Macrophages",
+  "Cycling B Cells",
+  "Mesenchymal Stem Cells"
+)
+
+cluster_colors <- c(
+  "Inflammatory Early Neutrophils"          = "#F8766D",
+  "Antigen-presenting B Cells"              = "#EC823C",
+  "Mature CXCR2+ Neutrophils"               = "#DD8D00",
+  "Neutrophils (Metamyelocyte)"             = "#CA9700",
+  "Pre-B Cells"                             = "#B3A000",
+  "Neutrophils (Promyelocytes)"             = "#97A900",
+  "Granulocyte-Monocyte Progenitors (GMPs)" = "#71B000",
+  "Classical Monocytes"                     = "#2FB600",
+  "CD3+ T Cells"                            = "#00BB4B",
+  "Immature B Cells"                        = "#00BF76",
+  "Proliferating Myeloid Progenitors"       = "#00C098",
+  "Cycling Pre-B Cells"                     = "#00C0B7",
+  "Proerythroblasts"                        = "#00BDD1",
+  "Macrophages"                             = "#00B7E8",
+  "Hematopoietic Stem Cells"                = "#00AEFA",
+  "Plasmacytoid Dendritic Cells"            = "#3DA1FF",
+  "Pro-B Cells"                             = "#8F91FF",
+  "Cycling Promyelocytes"                   = "#BE80FF",
+  "Eyrthrocytes"                            = "#DE71F9",
+  "Basophils"                               = "#F265E7",
+  "Resident Macrophages"                    = "#FE61CF",
+  "Cycling B Cells"                         = "#FF64B3",
+  "Mesenchymal Stem Cells"                  = "#FF6C92"
+)
+
+Idents(obj) <- factor(as.character(Idents(obj)), levels = desired_order)
+obj$cell_type <- factor(as.character(Idents(obj)), levels = desired_order)
+
+cluster_order <- desired_order
+
+# Store plotting metadata in the Seurat object for reuse by downstream scripts.
+obj@misc$cluster_order <- cluster_order
+obj@misc$cluster_colors <- cluster_colors
+```
+
+```{r}
+markers <- FindAllMarkers(
+  obj,
+  only.pos = TRUE,
+  min.pct = 0.5,
+  logfc.threshold = 0.25
+)
+write.csv(markers, file.path(out_dir, "cluster_markers_RNA.csv"), row.names = FALSE)
+```
+
+```{r}
+obj$cluster_number <- factor(
+  obj$seurat_clusters,
+  levels = names(cluster_ids)
+)
+
+number_colors <- setNames(cluster_colors[cluster_ids], names(cluster_ids))
+number_labels <- setNames(
+  paste0(names(cluster_ids), " : ", cluster_ids),
+  names(cluster_ids)
+)
+
+p_umap <- DimPlot(
+  obj,
+  reduction = "umap",
+  group.by = "cluster_number",
+  split.by = "SampleGroup",
+  ncol = 4,
+  label = TRUE,
+  label.size = 5,
+  repel = TRUE,
+  pt.size = 1
+) +
+  scale_color_manual(
+    values = number_colors,
+    breaks = names(cluster_ids),
+    labels = number_labels,
+    drop = FALSE
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4), ncol = 1)) +
+  theme(
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 16, face = "bold")
+  )
+
+p_umap
+ggsave(file.path(fig_dir, "Figure1A_UMAP.png"), p_umap, width = 18, height = 6, dpi = 300)
+```
+
+```{r}
+composition <- tibble(
+  Cluster = factor(obj$cell_type, levels = cluster_order),
+  SampleGroup = obj$SampleGroup
+) %>%
+  count(Cluster, SampleGroup, name = "n") %>%
+  complete(Cluster, SampleGroup, fill = list(n = 0)) %>%
+  group_by(SampleGroup) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+p_composition <- ggplot(
+  composition,
+  aes(x = SampleGroup, y = percent, fill = Cluster)
+) +
+  geom_col(width = 0.8, color = "black", linewidth = 0.25) +
+  scale_fill_manual(values = cluster_colors, drop = FALSE) +
+  labs(x = NULL, y = "% of all cells", fill = NULL) +
+  theme_bw(base_size = 12)
+
+p_composition
+ggsave(file.path(fig_dir, "Figure1B_composition.png"), p_composition, width = 11, height = 7, dpi = 300)
+```
+
+```{r}
+marker_genes <- c(
+  "Csf3r", "Ighd", "Retnlg", "Ltf", "Bach2", "Orm1", "Ms4a3", "Fn1",
+  "Il2rb", "Ms4a1", "Itga1", "Pclaf", "Car1", "Apoe", "Ctla2a", "Siglech",
+  "Vpreb2", "Stmn1", "Slfn14", "Fcer1a", "C1qb", "Ccnd2", "Col1a2",
+  "Cd19", "Ly6g", "Cd3e", "Csf1r", "Cd11c"
+)
+
+p_markers <- DotPlot(obj, features = marker_genes) +
+  RotatedAxis() +
+  theme_minimal(base_size = 12)
+
+p_markers
+ggsave(file.path(fig_dir, "Figure1D_marker_dotplot.png"), p_markers, width = 13, height = 8, dpi = 300)
+```
+
+```{r}
+two_line_labels <- function(x) {
+  vapply(x, function(label) {
+    words <- str_split(label, "\\s+")[[1]]
+    if (length(words) <= 1) return(label)
+    split_at <- ceiling(length(words) / 2)
+    paste(
+      paste(words[seq_len(split_at)], collapse = " "),
+      paste(words[(split_at + 1):length(words)], collapse = " "),
+      sep = "\n"
+    )
+  }, character(1))
+}
+
+for (gene in c("Isg15", "Ifi27l2a", "Irf7")) {
+  p <- VlnPlot(
+    obj,
+    features = gene,
+    split.by = "SampleGroup",
+    layer = "data"
+  ) +
+    scale_x_discrete(labels = two_line_labels(levels(Idents(obj)))) +
+    guides(x = guide_axis(angle = 30)) +
+    theme(
+      axis.text.x = element_text(hjust = 0.5, vjust = 1),
+      plot.margin = margin(5.5, 5.5, 22, 30)
+    ) +
+    coord_cartesian(clip = "off")
+
+  print(p)
+  ggsave(file.path(fig_dir, paste0("Figure5_", gene, "_violin.png")), p,
+         width = 12, height = 6, dpi = 300)
+}
+```
+
+```{r}
+saveRDS(obj, file.path(out_dir, "processed_combined_obj.rds"))
+```

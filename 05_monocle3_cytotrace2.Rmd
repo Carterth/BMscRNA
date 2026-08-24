@@ -1,0 +1,301 @@
+---
+title: "Trajectory and differentiation-potential analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratWrappers)
+  library(monocle3)
+  library(CytoTRACE2)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+})
+
+obj <- readRDS(file.path("results", "processed_combined_obj.rds"))
+
+fig_dir <- "figures"
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+build_trajectory <- function(seu, tissue_name, root_cluster = "14") {
+
+  if (!"umap" %in% names(seu@reductions)) {
+    stop("UMAP reduction is missing from the Seurat object.")
+  }
+
+  if (!"seurat_clusters" %in% colnames(seu@meta.data)) {
+    stop("seurat_clusters is missing from Seurat metadata.")
+  }
+
+  if (!"condition" %in% colnames(seu@meta.data)) {
+    stop("condition is missing from Seurat metadata.")
+  }
+
+  cds <- as.cell_data_set(seu)
+
+  # Use the UMAP coordinates generated in Seurat.
+  reducedDim(cds, "UMAP") <- Embeddings(seu, "umap")
+
+  # Transfer cluster and treatment metadata.
+  colData(cds)$seurat_clusters <- as.character(seu$seurat_clusters)
+  colData(cds)$condition <- as.character(seu$condition)
+
+  # Supply Seurat cluster assignments to Monocle3.
+  monocle_clusters <- factor(as.character(seu$seurat_clusters))
+  names(monocle_clusters) <- colnames(cds)
+  cds@clusters$UMAP$clusters <- monocle_clusters
+
+  # Treat all cells within each tissue as a single partition.
+  monocle_partitions <- factor(rep(1, ncol(cds)))
+  names(monocle_partitions) <- colnames(cds)
+  cds@clusters$UMAP$partitions <- monocle_partitions
+
+  cds <- learn_graph(
+    cds,
+    use_partition = FALSE
+  )
+
+  # Seurat cluster 14 corresponds to Hematopoietic Stem Cells.
+  root_cells <- colnames(cds)[
+    as.character(colData(cds)$seurat_clusters) ==
+      as.character(root_cluster)
+  ]
+
+  if (length(root_cells) == 0) {
+    stop(
+      "No root cells found for cluster ",
+      root_cluster,
+      " in ",
+      tissue_name
+    )
+  }
+
+  cds <- order_cells(
+    cds,
+    root_cells = root_cells
+  )
+
+  p_trajectory <- plot_cells(
+    cds,
+    color_cells_by = "pseudotime",
+    show_trajectory_graph = TRUE,
+    label_groups_by_cluster = FALSE,
+    label_leaves = FALSE,
+    label_branch_points = FALSE
+  ) +
+    ggtitle(tissue_name)
+
+  pt <- tibble(
+    pseudotime = monocle3::pseudotime(cds),
+    condition = factor(
+      as.character(colData(cds)$condition),
+      levels = c("VEH", "THC")
+    )
+  ) %>%
+    filter(is.finite(pseudotime))
+
+  p_density <- ggplot(
+    pt,
+    aes(
+      x = pseudotime,
+      fill = condition
+    )
+  ) +
+    geom_density(alpha = 0.4) +
+    labs(
+      x = "Pseudotime",
+      y = "Density",
+      fill = "Condition"
+    ) +
+    theme_classic()
+
+  return(
+    list(
+      cds = cds,
+      trajectory = p_trajectory,
+      density = p_density
+    )
+  )
+}
+
+femoral_trajectory <- build_trajectory(
+  seu = subset(obj, subset = tissue == "Femoral"),
+  tissue_name = "Femoral",
+  root_cluster = "14"
+)
+
+calvarial_trajectory <- build_trajectory(
+  seu = subset(obj, subset = tissue == "Calvarial"),
+  tissue_name = "Calvarial",
+  root_cluster = "14"
+)
+
+femoral_trajectory$trajectory
+calvarial_trajectory$trajectory
+femoral_trajectory$density
+calvarial_trajectory$density
+
+ggsave(
+  file.path(fig_dir, "Figure1E_femoral_trajectory.png"),
+  femoral_trajectory$trajectory,
+  width = 7.5,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure1F_calvarial_trajectory.png"),
+  calvarial_trajectory$trajectory,
+  width = 7.5,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure1G_femoral_pseudotime_density.png"),
+  femoral_trajectory$density,
+  width = 6.5,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure1H_calvarial_pseudotime_density.png"),
+  calvarial_trajectory$density,
+  width = 6.5,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r}
+condition_colors <- c(
+  VEH = "#4472C4",
+  THC = "#D95319"
+)
+
+cluster_order <- obj@misc$cluster_order
+
+run_cytotrace2 <- function(seu, tissue_name) {
+
+  if (is.null(cluster_order)) {
+    stop("Cluster order was not found in obj@misc$cluster_order.")
+  }
+
+  if (!"condition" %in% colnames(seu@meta.data)) {
+    stop("condition is missing from Seurat metadata.")
+  }
+
+  ct2 <- CytoTRACE2::cytotrace2(
+    seu,
+    is_seurat = TRUE,
+    slot_type = "counts",
+    species = "mouse"
+  )
+
+  score_col <- grep(
+    "^CytoTRACE2_?Score$",
+    colnames(ct2[[]]),
+    value = TRUE
+  )[1]
+
+  if (is.na(score_col)) {
+    stop("CytoTRACE2 score column not found.")
+  }
+
+  ct2$CytoTRACE2_Score <- ct2[[]][[score_col]]
+
+  df <- tibble(
+    cluster = factor(
+      as.character(Idents(ct2)),
+      levels = cluster_order
+    ),
+    condition = factor(
+      as.character(ct2$condition),
+      levels = c("VEH", "THC")
+    ),
+    score = ct2$CytoTRACE2_Score
+  ) %>%
+    filter(complete.cases(.))
+
+  p <- ggplot(
+    df,
+    aes(
+      x = cluster,
+      y = score,
+      color = condition
+    )
+  ) +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.55,
+      position = position_dodge(width = 0.6)
+    ) +
+    geom_point(
+      position = position_jitterdodge(
+        jitter.width = 0.2,
+        dodge.width = 0.6
+      ),
+      alpha = 0.35,
+      size = 0.55
+    ) +
+    scale_color_manual(values = condition_colors) +
+    labs(
+      x = NULL,
+      y = "CytoTRACE2 score",
+      color = "Condition"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      )
+    )
+
+  return(
+    list(
+      object = ct2,
+      plot = p
+    )
+  )
+}
+
+femoral_ct2 <- run_cytotrace2(
+  seu = subset(obj, subset = tissue == "Femoral"),
+  tissue_name = "Femoral"
+)
+
+calvarial_ct2 <- run_cytotrace2(
+  seu = subset(obj, subset = tissue == "Calvarial"),
+  tissue_name = "Calvarial"
+)
+
+femoral_ct2$plot
+calvarial_ct2$plot
+
+ggsave(
+  file.path(fig_dir, "Figure1I_femoral_CytoTRACE2.png"),
+  femoral_ct2$plot,
+  width = 11,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure1J_calvarial_CytoTRACE2.png"),
+  calvarial_ct2$plot,
+  width = 11,
+  height = 6,
+  dpi = 300
+)
+```
+

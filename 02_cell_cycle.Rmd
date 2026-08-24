@@ -1,0 +1,61 @@
+---
+title: "Cell-cycle scoring"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(gprofiler2)
+  library(ggplot2)
+})
+
+obj <- readRDS(file.path("results", "processed_combined_obj.rds"))
+fig_dir <- "figures"
+```
+
+```{r}
+s_genes_human <- cc.genes$s.genes
+g2m_genes_human <- cc.genes$g2m.genes
+
+s_genes_mouse <- gorth(
+  s_genes_human,
+  source_organism = "hsapiens",
+  target_organism = "mmusculus"
+)$ortholog_name
+
+g2m_genes_mouse <- gorth(
+  g2m_genes_human,
+  source_organism = "hsapiens",
+  target_organism = "mmusculus"
+)$ortholog_name
+
+obj <- CellCycleScoring(
+  obj,
+  s.features = s_genes_mouse,
+  g2m.features = g2m_genes_mouse,
+  set.ident = FALSE
+)
+```
+
+```{r}
+p_cell_cycle <- DimPlot(
+  obj,
+  group.by = "Phase",
+  split.by = "stim_facet",
+  pt.size = 0.8
+) +
+  theme(strip.text = element_text(face = "bold"))
+
+p_cell_cycle
+ggsave(file.path(fig_dir, "Figure1C_cell_cycle.png"), p_cell_cycle,
+       width = 13, height = 5, dpi = 300)
+```
+
+```{r}
+saveRDS(obj, file.path("results", "processed_combined_obj_cellcycle.rds"))
+```

@@ -1,0 +1,380 @@
+---
+title: "Myeloid subclustering and interferon analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(stringr)
+  library(scales)
+  library(fgsea)
+  library(msigdbr)
+  library(readr)
+  library(pheatmap)
+})
+
+obj <- readRDS(file.path("results", "processed_combined_obj.rds"))
+fig_dir <- "figures"
+out_dir <- file.path("results", "myeloid")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+myeloid_parent_clusters <- c(
+  "Inflammatory Early Neutrophils",
+  "Mature CXCR2+ Neutrophils",
+  "Neutrophils (Metamyelocyte)",
+  "Neutrophils (Promyelocytes)",
+  "Granulocyte-Monocyte Progenitors (GMPs)",
+  "Classical Monocytes",
+  "Proliferating Myeloid Progenitors",
+  "Macrophages",
+  "Plasmacytoid Dendritic Cells",
+  "Resident Macrophages"
+)
+
+MyeloidSubset <- subset(obj, idents = myeloid_parent_clusters)
+DefaultAssay(MyeloidSubset) <- "RNA"
+
+MyeloidSubset <- FindVariableFeatures(
+  MyeloidSubset,
+  selection.method = "vst",
+  nfeatures = 2000
+)
+MyeloidSubset <- RunPCA(
+  MyeloidSubset,
+  features = VariableFeatures(MyeloidSubset)
+)
+MyeloidSubset <- FindNeighbors(MyeloidSubset, dims = 1:15)
+MyeloidSubset <- FindClusters(MyeloidSubset, resolution = 0.5)
+MyeloidSubset <- RunUMAP(MyeloidSubset, dims = 1:15)
+```
+
+```{r}
+myeloid_markers <- FindAllMarkers(
+  MyeloidSubset,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+write_csv(myeloid_markers, file.path(out_dir, "myeloid_cluster_markers.csv"))
+
+myeloid_ids <- c(
+  "0" = "Retnlg-hi Neut",
+  "1" = "Ltf+ ImmNeu",
+  "2" = "Band Neu",
+  "3" = "Classical Mono",
+  "4" = "Inflam Neut",
+  "5" = "cMOP",
+  "6" = "Pre-Neut",
+  "7" = "GMPs",
+  "8" = "ProMyel",
+  "9" = "pDCs",
+  "10" = "Lipid Mac",
+  "11" = "Iron Mac"
+)
+
+MyeloidSubset <- RenameIdents(MyeloidSubset, myeloid_ids)
+MyeloidSubset$myeloid_cell_type <- as.character(Idents(MyeloidSubset))
+myeloid_order <- unname(myeloid_ids)
+myeloid_colors <- setNames(scales::hue_pal()(length(myeloid_order)), myeloid_order)
+```
+
+```{r}
+MyeloidSubset$cluster_number <- factor(
+  MyeloidSubset$seurat_clusters,
+  levels = names(myeloid_ids)
+)
+
+number_colors <- setNames(myeloid_colors[myeloid_ids], names(myeloid_ids))
+number_labels <- setNames(
+  paste0(names(myeloid_ids), " : ", myeloid_ids),
+  names(myeloid_ids)
+)
+
+p_umap <- DimPlot(
+  MyeloidSubset,
+  reduction = "umap",
+  group.by = "cluster_number",
+  split.by = "SampleGroup",
+  ncol = 4,
+  label = TRUE,
+  label.size = 5,
+  repel = TRUE,
+  pt.size = 1
+) +
+  scale_color_manual(
+    values = number_colors,
+    breaks = names(myeloid_ids),
+    labels = number_labels,
+    drop = FALSE
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4), ncol = 1)) +
+  theme(legend.title = element_blank())
+
+p_umap
+ggsave(file.path(fig_dir, "Figure4A_myeloid_UMAP.png"), p_umap,
+       width = 18, height = 6, dpi = 300)
+```
+
+```{r}
+composition <- tibble(
+  SampleGroup = MyeloidSubset$SampleGroup,
+  Cluster = factor(MyeloidSubset$myeloid_cell_type, levels = myeloid_order)
+) %>%
+  count(SampleGroup, Cluster, name = "n") %>%
+  group_by(SampleGroup) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+p_composition <- ggplot(composition, aes(SampleGroup, prop, fill = Cluster)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = myeloid_colors, drop = FALSE) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = NULL, y = "Proportion of myeloid cells", fill = "Cluster") +
+  theme_minimal(base_size = 12)
+
+p_composition
+ggsave(file.path(fig_dir, "Figure4B_myeloid_composition.png"), p_composition,
+       width = 9, height = 6, dpi = 300)
+```
+
+```{r}
+prep_deg <- function(deg) {
+  deg %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(gene), nchar(gene) > 0, is.finite(avg_log2FC)) %>%
+    group_by(gene) %>%
+    slice_min(p_val_adj, with_ties = FALSE) %>%
+    ungroup()
+}
+
+run_de <- function(tissue_name) {
+  sub <- subset(
+    MyeloidSubset,
+    cells = colnames(MyeloidSubset)[MyeloidSubset$tissue == tissue_name]
+  )
+  Idents(sub) <- factor(sub$condition, levels = c("VEH", "THC"))
+
+  deg <- FindMarkers(
+    sub,
+    ident.1 = "THC",
+    ident.2 = "VEH",
+    assay = "RNA",
+    test.use = "wilcox",
+    logfc.threshold = 0,
+    min.pct = 0
+  )
+
+  prep_deg(deg)
+}
+
+deg_femoral <- run_de("Femoral")
+deg_calvarial <- run_de("Calvarial")
+
+write_csv(deg_femoral, file.path(out_dir, "Femoral_myeloid_THC_vs_VEH_DEG.csv"))
+write_csv(deg_calvarial, file.path(out_dir, "Calvarial_myeloid_THC_vs_VEH_DEG.csv"))
+```
+
+```{r}
+make_volcano <- function(deg, tissue_name) {
+  padj_cut <- 0.05
+  lfc_cut <- 0.25
+
+  df <- deg %>%
+    mutate(
+      neglog10padj = -log10(pmax(p_val_adj, .Machine$double.xmin)),
+      group = case_when(
+        p_val_adj <= padj_cut & avg_log2FC >= lfc_cut ~ "Up in THC",
+        p_val_adj <= padj_cut & avg_log2FC <= -lfc_cut ~ "Down in THC",
+        TRUE ~ "Not significant"
+      )
+    )
+
+  label_genes <- df %>%
+    filter(p_val_adj <= padj_cut, abs(avg_log2FC) >= lfc_cut) %>%
+    arrange(p_val_adj, desc(abs(avg_log2FC))) %>%
+    slice_head(n = 10) %>%
+    pull(gene)
+
+  df$label <- ifelse(df$gene %in% label_genes, df$gene, NA_character_)
+
+  ggplot(df, aes(avg_log2FC, neglog10padj)) +
+    geom_point(aes(color = group), alpha = 0.75, size = 1.4) +
+    geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = 2) +
+    geom_hline(yintercept = -log10(padj_cut), linetype = 2) +
+    scale_color_manual(values = c(
+      "Down in THC" = "#0072B2",
+      "Not significant" = "grey80",
+      "Up in THC" = "#D55E00"
+    )) +
+    geom_text_repel(
+      data = subset(df, !is.na(label)),
+      aes(label = label),
+      size = 3.2,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    ) +
+    labs(
+      title = tissue_name,
+      x = expression(log[2]~Fold~Change~(THC/VEH)),
+      y = expression(-log[10]~adjusted~italic(p))
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.title = element_blank(), legend.position = "top")
+}
+
+p_femoral_volcano <- make_volcano(deg_femoral, "Femoral myeloid")
+p_calvarial_volcano <- make_volcano(deg_calvarial, "Calvarial myeloid")
+
+p_femoral_volcano
+p_calvarial_volcano
+
+ggsave(file.path(fig_dir, "Figure4C_femoral_myeloid_volcano.png"),
+       p_femoral_volcano, width = 6.5, height = 5.2, dpi = 300)
+ggsave(file.path(fig_dir, "Figure4E_calvarial_myeloid_volcano.png"),
+       p_calvarial_volcano, width = 6.5, height = 5.2, dpi = 300)
+```
+
+```{r}
+hallmark <- msigdbr(species = "Mus musculus", collection = "H") %>%
+  select(gs_name, gene_symbol)
+hallmark_sets <- split(hallmark$gene_symbol, hallmark$gs_name)
+
+run_gsea <- function(deg, tissue_name) {
+  ranks <- setNames(deg$avg_log2FC, deg$gene)
+  set.seed(123)
+  fg <- fgsea(
+    pathways = hallmark_sets,
+    stats = ranks,
+    minSize = 10,
+    maxSize = 1000,
+    nperm = 10000
+  ) %>%
+    arrange(padj)
+
+  plot_df <- fg %>%
+    slice_head(n = 5) %>%
+    mutate(
+      Pathway = str_remove(pathway, "^HALLMARK_") %>% str_replace_all("_", " "),
+      mlogFDR = -log10(pmax(padj, .Machine$double.xmin)),
+      Pathway = factor(Pathway, levels = Pathway)
+    )
+
+  p <- ggplot(plot_df, aes(NES, Pathway)) +
+    geom_segment(aes(x = 0, xend = NES, yend = Pathway), alpha = 0.6) +
+    geom_point(aes(size = mlogFDR, color = NES)) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    scale_color_gradient2(low = "#2676B8", mid = "grey90", high = "#CB3E38", midpoint = 0) +
+    labs(title = tissue_name, x = "Normalized enrichment score", y = NULL) +
+    theme_classic(base_size = 12)
+
+  list(table = fg, plot = p)
+}
+
+gsea_femoral <- run_gsea(deg_femoral, "Femoral myeloid")
+gsea_calvarial <- run_gsea(deg_calvarial, "Calvarial myeloid")
+
+write_csv(gsea_femoral$table, file.path(out_dir, "Femoral_myeloid_Hallmark_GSEA.csv"))
+write_csv(gsea_calvarial$table, file.path(out_dir, "Calvarial_myeloid_Hallmark_GSEA.csv"))
+
+gsea_femoral$plot
+gsea_calvarial$plot
+
+ggsave(file.path(fig_dir, "Figure4D_femoral_myeloid_GSEA.png"),
+       gsea_femoral$plot, width = 7.5, height = 5.5, dpi = 300)
+ggsave(file.path(fig_dir, "Figure4F_calvarial_myeloid_GSEA.png"),
+       gsea_calvarial$plot, width = 7.5, height = 5.5, dpi = 300)
+```
+
+```{r}
+isg_panel <- c(
+  "Ifi27l2a", "Ifitm3", "Isg15", "Irf7", "Rsad2", "Stat1", "Ifit3",
+  "Zbp1", "Oas3", "Usp18", "Gbp2", "Ifih1", "B2m", "H2-K1", "H2-Q7", "H2-D1"
+)
+
+MyeloidSubset <- AddModuleScore(
+  MyeloidSubset,
+  features = list(isg_panel),
+  name = "ISGscore"
+)
+
+p_isg_score <- FeaturePlot(
+  MyeloidSubset,
+  features = "ISGscore1",
+  reduction = "umap",
+  split.by = "SampleGroup",
+  cols = colorRampPalette(c("#2166AC", "grey95", "#B2182B"))(100),
+  pt.size = 1,
+  min.cutoff = "q10",
+  max.cutoff = "q90",
+  order = TRUE
+)
+
+p_isg_score
+ggsave(file.path(fig_dir, "Figure4H_myeloid_ISG_score.png"),
+       p_isg_score, width = 14, height = 5, dpi = 300)
+```
+
+```{r}
+groups <- levels(MyeloidSubset$SampleGroup)
+
+deg_by_group <- lapply(groups, function(group_name) {
+  x <- FindMarkers(
+    MyeloidSubset,
+    ident.1 = group_name,
+    group.by = "SampleGroup",
+    assay = "RNA",
+    slot = "data",
+    logfc.threshold = 0,
+    min.pct = 0
+  )
+
+  tibble(
+    SampleGroup = group_name,
+    gene = rownames(x),
+    avg_log2FC = x$avg_log2FC
+  )
+}) %>%
+  bind_rows()
+
+isg_mat <- deg_by_group %>%
+  filter(gene %in% isg_panel) %>%
+  pivot_wider(
+    names_from = SampleGroup,
+    values_from = avg_log2FC,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+lim <- max(abs(isg_mat), na.rm = TRUE)
+breaks <- seq(-lim, lim, length.out = 101)
+palette <- colorRampPalette(c("navy", "white", "firebrick"))(100)
+
+png(file.path(fig_dir, "Figure4G_myeloid_ISG_heatmap.png"),
+    width = 2100, height = 2100, res = 300)
+pheatmap(
+  isg_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = palette,
+  breaks = breaks,
+  fontsize = 11
+)
+dev.off()
+```
+
+```{r}
+saveRDS(MyeloidSubset, file.path(out_dir, "MyeloidSubset_final.rds"))
+```

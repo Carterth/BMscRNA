@@ -1,0 +1,181 @@
+---
+title: "Calvarial marrow differential expression and GSEA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(stringr)
+  library(fgsea)
+  library(msigdbr)
+  library(readr)
+  library(scales)
+})
+
+obj <- readRDS(file.path("results", "processed_combined_obj.rds"))
+fig_dir <- "figures"
+out_dir <- "results"
+
+cluster_order <- levels(Idents(obj))
+cluster_colors <- setNames(scales::hue_pal()(length(cluster_order)), cluster_order)
+```
+
+```{r}
+calvarial <- subset(obj, subset = tissue == "Calvarial")
+
+composition <- tibble(
+  Cluster = factor(as.character(Idents(calvarial)), levels = cluster_order),
+  condition = factor(calvarial$condition, levels = c("VEH", "THC"))
+) %>%
+  count(Cluster, condition, name = "n") %>%
+  complete(Cluster, condition, fill = list(n = 0)) %>%
+  group_by(Cluster) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+p_composition <- ggplot(
+  composition,
+  aes(x = Cluster, y = percent, fill = Cluster, alpha = condition)
+) +
+  geom_col(color = "black", linewidth = 0.5) +
+  scale_fill_manual(values = cluster_colors, guide = "none", drop = FALSE) +
+  scale_alpha_manual(values = c(VEH = 0.35, THC = 1), name = "Condition") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(x = "Cluster", y = "% of cluster") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 55, hjust = 1, face = "bold"))
+
+p_composition
+ggsave(file.path(fig_dir, "Figure3A_calvarial_composition.png"), p_composition,
+       width = 16, height = 7, dpi = 300)
+```
+
+```{r}
+DefaultAssay(calvarial) <- "RNA"
+Idents(calvarial) <- factor(calvarial$condition, levels = c("VEH", "THC"))
+
+# This value is retained from the original calvarial analysis script.
+min_pct_global <- 0.1
+
+deg_calvarial <- FindMarkers(
+  calvarial,
+  ident.1 = "THC",
+  ident.2 = "VEH",
+  assay = "RNA",
+  test.use = "wilcox",
+  logfc.threshold = 0,
+  min.pct = min_pct_global,
+  only.pos = FALSE
+) %>%
+  rownames_to_column("gene") %>%
+  arrange(p_val_adj, desc(abs(avg_log2FC)))
+
+write_csv(deg_calvarial, file.path(out_dir, "Calvarial_THC_vs_VEH_DEG.csv"))
+```
+
+```{r}
+padj_cut <- 0.05
+lfc_cut <- 0.25
+
+volcano_df <- deg_calvarial %>%
+  mutate(
+    neglog10padj = -log10(pmax(p_val_adj, .Machine$double.xmin)),
+    group = case_when(
+      p_val_adj < padj_cut & avg_log2FC >= lfc_cut ~ "Up in THC",
+      p_val_adj < padj_cut & avg_log2FC <= -lfc_cut ~ "Down in THC",
+      TRUE ~ "Not significant"
+    )
+  )
+
+top_up <- volcano_df %>%
+  filter(group == "Up in THC") %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 3) %>%
+  pull(gene)
+
+top_down <- volcano_df %>%
+  filter(group == "Down in THC") %>%
+  arrange(avg_log2FC) %>%
+  slice_head(n = 15) %>%
+  pull(gene)
+
+volcano_df$label <- ifelse(
+  volcano_df$gene %in% c(top_up, top_down),
+  volcano_df$gene,
+  NA_character_
+)
+
+p_volcano <- ggplot(volcano_df, aes(avg_log2FC, neglog10padj)) +
+  geom_point(aes(color = group), alpha = 0.75, size = 1.4) +
+  geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = 2, linewidth = 0.4) +
+  geom_hline(yintercept = -log10(padj_cut), linetype = 2, linewidth = 0.4) +
+  scale_color_manual(values = c(
+    "Down in THC" = "#0072B2",
+    "Not significant" = "grey80",
+    "Up in THC" = "#D55E00"
+  )) +
+  geom_text_repel(
+    data = subset(volcano_df, !is.na(label)),
+    aes(label = label),
+    size = 3.2,
+    max.overlaps = Inf,
+    min.segment.length = 0
+  ) +
+  labs(x = expression(log[2]~Fold~Change~(THC/VEH)),
+       y = expression(-log[10]~adjusted~italic(p))) +
+  theme_bw(base_size = 12) +
+  theme(legend.title = element_blank(), legend.position = "top")
+
+p_volcano
+ggsave(file.path(fig_dir, "Figure3B_calvarial_volcano.png"), p_volcano,
+       width = 6.5, height = 5.2, dpi = 300)
+```
+
+```{r}
+hallmark <- msigdbr(species = "Mus musculus", collection = "H") %>%
+  select(gs_name, gene_symbol)
+hallmark_sets <- split(hallmark$gene_symbol, hallmark$gs_name)
+
+ranks <- setNames(deg_calvarial$avg_log2FC, deg_calvarial$gene)
+set.seed(123)
+gsea_calvarial <- fgsea(
+  pathways = hallmark_sets,
+  stats = ranks,
+  minSize = 10,
+  maxSize = 1000,
+  nperm = 10000
+) %>%
+  arrange(padj)
+
+write_csv(gsea_calvarial, file.path(out_dir, "Calvarial_THC_vs_VEH_Hallmark_GSEA.csv"))
+
+plot_df <- gsea_calvarial %>%
+  slice_head(n = 10) %>%
+  mutate(
+    Pathway = str_remove(pathway, "^HALLMARK_") %>% str_replace_all("_", " "),
+    mlogFDR = -log10(pmax(padj, .Machine$double.xmin)),
+    Pathway = factor(Pathway, levels = Pathway[order(NES)])
+  )
+
+p_gsea <- ggplot(plot_df, aes(NES, Pathway)) +
+  geom_segment(aes(x = 0, xend = NES, yend = Pathway), color = "grey85") +
+  geom_point(aes(size = mlogFDR, color = NES)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  scale_color_gradient2(low = "#2676B8", mid = "grey90", high = "#CB3E38", midpoint = 0) +
+  labs(x = "Normalized enrichment score", y = NULL) +
+  theme_classic(base_size = 12)
+
+p_gsea
+ggsave(file.path(fig_dir, "Figure3C_calvarial_Hallmark_GSEA.png"), p_gsea,
+       width = 7.5, height = 6, dpi = 300)
+```
